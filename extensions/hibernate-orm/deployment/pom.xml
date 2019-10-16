@@ -87,6 +87,11 @@
             <artifactId>jboss-jaxb-api_2.3_spec</artifactId>
             <scope>test</scope>
         </dependency>
+        <dependency>
+        <groupId>io.quarkus</groupId>
+        <artifactId>quarkus-resteasy-jsonb</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
