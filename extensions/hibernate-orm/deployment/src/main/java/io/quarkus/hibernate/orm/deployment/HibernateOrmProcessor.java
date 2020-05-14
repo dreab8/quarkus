@@ -171,6 +171,7 @@ public final class HibernateOrmProcessor {
             List<AdditionalJpaModelBuildItem> additionalJpaModelBuildItems,
             List<NonJpaModelBuildItem> nonJpaModelBuildItems,
             List<IgnorableNonIndexedClasses> ignorableNonIndexedClassesBuildItems,
+            List<BytecodeTransformerBuildItem> bytecodeTransformerBuildItems,
             CombinedIndexBuildItem index,
             ArchiveRootBuildItem archiveRoot,
             ApplicationArchivesBuildItem applicationArchivesBuildItem,
