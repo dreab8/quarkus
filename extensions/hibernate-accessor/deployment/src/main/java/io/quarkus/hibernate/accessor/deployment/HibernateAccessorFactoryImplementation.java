@@ -4,6 +4,10 @@ import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorGenerati
 import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorGenerationUtil.emitStringSwitch;
 import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorGenerationUtil.fqcnToName;
 import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorGenerationUtil.pushIntConst;
+import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorSingleImplGenerator.INSTANTIATOR_INTERFACE;
+import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorSingleImplGenerator.READER_INTERFACE;
+import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorSingleImplGenerator.SERIALIZABLE_INTERFACE;
+import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorSingleImplGenerator.WRITER_INTERFACE;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -12,10 +16,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.hibernate.accessor.HibernateAccessorFactory;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Label;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
+
+import io.quarkus.hibernate.accessor.runtime.spi.NamingUtil;
 
 class HibernateAccessorFactoryImplementation implements Opcodes {
 
@@ -36,12 +43,9 @@ class HibernateAccessorFactoryImplementation implements Opcodes {
     private static final String INSTANTIATOR_IMPL_INTERNAL = fqcnToName(
             HibernateAccessorSingleImplGenerator.INSTANTIATOR_IMPL);
 
-    private static final String READER_INTERFACE = "org/hibernate/accessor/HibernateAccessorValueReader";
-    private static final String WRITER_INTERFACE = "org/hibernate/accessor/HibernateAccessorValueWriter";
-    private static final String INSTANTIATOR_INTERFACE = "org/hibernate/accessor/HibernateAccessorInstantiator";
-    private static final String FACTORY_INTERFACE = "org/hibernate/accessor/HibernateAccessorFactory";
+    private static final String FACTORY_INTERFACE = fqcnToName(HibernateAccessorFactory.class.getName());
 
-    private static final String NAMING_UTIL = "io/quarkus/hibernate/accessor/runtime/spi/NamingUtil";
+    private static final String NAMING_UTIL = fqcnToName(NamingUtil.class.getName());
 
     private static final String LOOKUP_DESCRIPTOR = "(Ljava/lang/String;)I";
 
@@ -87,7 +91,10 @@ class HibernateAccessorFactoryImplementation implements Opcodes {
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
 
         cw.visit(V17, ACC_PUBLIC | ACC_SUPER, FACTORY_INTERNAL, null,
-                "java/lang/Object", new String[] { FACTORY_INTERFACE });
+                "java/lang/Object", new String[] { FACTORY_INTERFACE, SERIALIZABLE_INTERFACE });
+
+        // Static singleton reference for readResolve() — preserves singleton across deserialization.
+        cw.visitField(ACC_PRIVATE | ACC_STATIC, "INSTANCE", "L" + FACTORY_INTERNAL + ";", null, null).visitEnd();
 
         generateArrayField(cw, "FIELD_READERS", READER_IMPL_INTERNAL);
         generateArrayField(cw, "METHOD_READERS", READER_IMPL_INTERNAL);
@@ -97,6 +104,7 @@ class HibernateAccessorFactoryImplementation implements Opcodes {
 
         generateClinit(cw);
         generateConstructor(cw);
+        generateReadResolve(cw);
 
         generateValueReaderField(cw);
         generateValueReaderMethod(cw);
@@ -209,7 +217,21 @@ class HibernateAccessorFactoryImplementation implements Opcodes {
         mv.visitCode();
         mv.visitVarInsn(ALOAD, 0);
         mv.visitMethodInsn(INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+        // Store the singleton reference for readResolve()
+        mv.visitVarInsn(ALOAD, 0);
+        mv.visitFieldInsn(PUTSTATIC, FACTORY_INTERNAL, "INSTANCE", "L" + FACTORY_INTERNAL + ";");
         mv.visitInsn(RETURN);
+        mv.visitMaxs(0, 0);
+        mv.visitEnd();
+    }
+
+    // readResolve() returns the static INSTANCE so deserialization preserves the singleton.
+    private static void generateReadResolve(ClassWriter cw) {
+        MethodVisitor mv = cw.visitMethod(ACC_PRIVATE, "readResolve",
+                "()Ljava/lang/Object;", null, null);
+        mv.visitCode();
+        mv.visitFieldInsn(GETSTATIC, FACTORY_INTERNAL, "INSTANCE", "L" + FACTORY_INTERNAL + ";");
+        mv.visitInsn(ARETURN);
         mv.visitMaxs(0, 0);
         mv.visitEnd();
     }
