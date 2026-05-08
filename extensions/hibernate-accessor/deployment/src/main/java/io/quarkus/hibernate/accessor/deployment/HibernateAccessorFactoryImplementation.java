@@ -1,5 +1,6 @@
 package io.quarkus.hibernate.accessor.deployment;
 
+import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorGenerationUtil.STRING_SWITCH_CHUNK_SIZE;
 import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorGenerationUtil.emitStringSwitch;
 import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorGenerationUtil.fqcnToName;
 import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorGenerationUtil.pushIntConst;
@@ -390,50 +391,70 @@ class HibernateAccessorFactoryImplementation implements Opcodes {
         mv.visitInsn(ATHROW);
     }
 
-    // Generates: static int lookupXxx(String className, String memberName) { ... }
-    // Outer switch on className delegates to host class lookup, adds base offset.
-    // Locals: slot 0 = className, slot 1 = memberName, slot 2 = outer temp, slot 3 = localIdx
     private void generateLookupMethod(ClassWriter cw, String methodName,
             List<ArrayEntry> entries, String hostLookupMethodName) {
-        MethodVisitor mv = cw.visitMethod(ACC_PRIVATE | ACC_STATIC, methodName,
-                "(Ljava/lang/String;Ljava/lang/String;)I", null, null);
-        mv.visitCode();
-
         if (entries.isEmpty()) {
-            pushIntConst(mv, -1);
-            mv.visitInsn(IRETURN);
-            mv.visitMaxs(0, 0);
-            mv.visitEnd();
+            generateEmptyLookup(cw, methodName);
             return;
         }
 
-        // Compute unique classes and their base offsets from the entries list
         Map<String, Integer> classBaseOffsets = new LinkedHashMap<>();
         for (int i = 0; i < entries.size(); i++) {
             classBaseOffsets.putIfAbsent(entries.get(i).declaringClass(), i);
         }
 
         List<String> classNames = classBaseOffsets.keySet().stream().toList();
+
+        if (classNames.size() <= STRING_SWITCH_CHUNK_SIZE) {
+            generateLookupSwitchMethod(cw, methodName, classNames, classBaseOffsets, hostLookupMethodName);
+        } else {
+            int numChunks = (classNames.size() + STRING_SWITCH_CHUNK_SIZE - 1) / STRING_SWITCH_CHUNK_SIZE;
+
+            List<List<String>> chunks = new ArrayList<>();
+            for (int i = 0; i < numChunks; i++) {
+                chunks.add(new ArrayList<>());
+            }
+            for (String className : classNames) {
+                int bucket = (className.hashCode() & 0x7FFFFFFF) % numChunks;
+                chunks.get(bucket).add(className);
+            }
+
+            for (int i = 0; i < numChunks; i++) {
+                if (!chunks.get(i).isEmpty()) {
+                    generateLookupSwitchMethod(cw, methodName + "$" + i,
+                            chunks.get(i), classBaseOffsets, hostLookupMethodName);
+                }
+            }
+
+            generateLookupDispatcher(cw, methodName, numChunks, chunks);
+        }
+    }
+
+    // Generates a lookup method with a single-level string switch on className.
+    // Locals: slot 0 = className, slot 1 = memberName, slot 2 = outer temp, slot 3 = localIdx
+    private void generateLookupSwitchMethod(ClassWriter cw, String methodName,
+            List<String> classNames, Map<String, Integer> classBaseOffsets,
+            String hostLookupMethodName) {
+        MethodVisitor mv = cw.visitMethod(ACC_PRIVATE | ACC_STATIC, methodName,
+                "(Ljava/lang/String;Ljava/lang/String;)I", null, null);
+        mv.visitCode();
+
         Label defaultLabel = new Label();
 
-        // Single-level string switch on className (slot 0, temp in slot 2)
         emitStringSwitch(mv, 0, 2, classNames, defaultLabel, (caseMv, classIdx) -> {
             String className = classNames.get(classIdx);
             String target = dispatchTargets.get(className);
             int baseOffset = classBaseOffsets.get(className);
 
-            // int localIdx = DispatchTarget.hostLookupMethod(memberName);
             caseMv.visitVarInsn(ALOAD, 1);
             caseMv.visitMethodInsn(INVOKESTATIC, target, hostLookupMethodName,
                     LOOKUP_DESCRIPTOR, interfaceTargets.contains(target));
             caseMv.visitVarInsn(ISTORE, 3);
 
-            // if (localIdx < 0) goto default
             caseMv.visitVarInsn(ILOAD, 3);
             Label notFound = new Label();
             caseMv.visitJumpInsn(IFLT, notFound);
 
-            // return baseOffset + localIdx
             if (baseOffset == 0) {
                 caseMv.visitVarInsn(ILOAD, 3);
             } else {
@@ -448,12 +469,63 @@ class HibernateAccessorFactoryImplementation implements Opcodes {
             caseMv.visitJumpInsn(GOTO, defaultLabel);
         });
 
-        // default: return -1
         mv.visitLabel(defaultLabel);
         mv.visitFrame(F_SAME, 0, null, 0, null);
         pushIntConst(mv, -1);
         mv.visitInsn(IRETURN);
 
+        mv.visitMaxs(0, 0);
+        mv.visitEnd();
+    }
+
+    // Generates: switch((className.hashCode() & 0x7FFFFFFF) % N) { case i: return lookupXxx$i(...); }
+    private void generateLookupDispatcher(ClassWriter cw, String methodName,
+            int numChunks, List<List<String>> chunks) {
+        MethodVisitor mv = cw.visitMethod(ACC_PRIVATE | ACC_STATIC, methodName,
+                "(Ljava/lang/String;Ljava/lang/String;)I", null, null);
+        mv.visitCode();
+
+        Label defaultLabel = new Label();
+        Label[] labels = new Label[numChunks];
+        for (int i = 0; i < numChunks; i++) {
+            labels[i] = chunks.get(i).isEmpty() ? defaultLabel : new Label();
+        }
+
+        mv.visitVarInsn(ALOAD, 0);
+        mv.visitMethodInsn(INVOKEVIRTUAL, "java/lang/String", "hashCode", "()I", false);
+        mv.visitLdcInsn(0x7FFFFFFF);
+        mv.visitInsn(IAND);
+        pushIntConst(mv, numChunks);
+        mv.visitInsn(IREM);
+        mv.visitTableSwitchInsn(0, numChunks - 1, defaultLabel, labels);
+
+        for (int i = 0; i < numChunks; i++) {
+            if (!chunks.get(i).isEmpty()) {
+                mv.visitLabel(labels[i]);
+                mv.visitFrame(F_SAME, 0, null, 0, null);
+                mv.visitVarInsn(ALOAD, 0);
+                mv.visitVarInsn(ALOAD, 1);
+                mv.visitMethodInsn(INVOKESTATIC, FACTORY_INTERNAL, methodName + "$" + i,
+                        "(Ljava/lang/String;Ljava/lang/String;)I", false);
+                mv.visitInsn(IRETURN);
+            }
+        }
+
+        mv.visitLabel(defaultLabel);
+        mv.visitFrame(F_SAME, 0, null, 0, null);
+        pushIntConst(mv, -1);
+        mv.visitInsn(IRETURN);
+
+        mv.visitMaxs(0, 0);
+        mv.visitEnd();
+    }
+
+    private static void generateEmptyLookup(ClassWriter cw, String methodName) {
+        MethodVisitor mv = cw.visitMethod(ACC_PRIVATE | ACC_STATIC, methodName,
+                "(Ljava/lang/String;Ljava/lang/String;)I", null, null);
+        mv.visitCode();
+        pushIntConst(mv, -1);
+        mv.visitInsn(IRETURN);
         mv.visitMaxs(0, 0);
         mv.visitEnd();
     }

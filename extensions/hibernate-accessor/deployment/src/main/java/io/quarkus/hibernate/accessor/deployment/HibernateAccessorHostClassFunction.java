@@ -5,6 +5,7 @@ import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorFactoryI
 import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorFactoryImplementation.INSTANTIATOR_LOOKUP;
 import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorFactoryImplementation.METHOD_READER_LOOKUP;
 import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorFactoryImplementation.METHOD_WRITER_LOOKUP;
+import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorGenerationUtil.STRING_SWITCH_CHUNK_SIZE;
 import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorGenerationUtil.SWITCH_CHUNK_SIZE;
 import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorGenerationUtil.emitStringSwitch;
 import static io.quarkus.hibernate.accessor.deployment.HibernateAccessorGenerationUtil.fqcnToName;
@@ -129,17 +130,88 @@ class HibernateAccessorHostClassFunction implements BiFunction<String, ClassVisi
         }
 
         private void generateNameLookup(String methodName, List<String> names) {
+            if (names.size() <= STRING_SWITCH_CHUNK_SIZE) {
+                generateNameLookupSwitch(methodName, names, null);
+            } else {
+                int numChunks = (names.size() + STRING_SWITCH_CHUNK_SIZE - 1) / STRING_SWITCH_CHUNK_SIZE;
+
+                List<List<String>> chunkNames = new ArrayList<>();
+                List<List<Integer>> chunkOriginalIndices = new ArrayList<>();
+                for (int i = 0; i < numChunks; i++) {
+                    chunkNames.add(new ArrayList<>());
+                    chunkOriginalIndices.add(new ArrayList<>());
+                }
+
+                for (int i = 0; i < names.size(); i++) {
+                    int bucket = (names.get(i).hashCode() & 0x7FFFFFFF) % numChunks;
+                    chunkNames.get(bucket).add(names.get(i));
+                    chunkOriginalIndices.get(bucket).add(i);
+                }
+
+                for (int i = 0; i < numChunks; i++) {
+                    if (!chunkNames.get(i).isEmpty()) {
+                        generateNameLookupSwitch(methodName + "$" + i,
+                                chunkNames.get(i), chunkOriginalIndices.get(i));
+                    }
+                }
+
+                generateNameLookupDispatcher(methodName, numChunks, chunkNames);
+            }
+        }
+
+        private void generateNameLookupSwitch(String methodName, List<String> names,
+                List<Integer> originalIndices) {
             MethodVisitor mv = cv.visitMethod(ACC_PUBLIC | ACC_STATIC, methodName,
                     "(Ljava/lang/String;)I", null, null);
             mv.visitCode();
 
             Label defaultLabel = new Label();
 
-            // slot 0 = name param, slot 1 = temp
             emitStringSwitch(mv, 0, 1, names, defaultLabel, (caseMv, caseIdx) -> {
-                pushIntConst(caseMv, caseIdx);
+                int returnIdx = originalIndices != null ? originalIndices.get(caseIdx) : caseIdx;
+                pushIntConst(caseMv, returnIdx);
                 caseMv.visitInsn(IRETURN);
             });
+
+            mv.visitLabel(defaultLabel);
+            mv.visitFrame(F_SAME, 0, null, 0, null);
+            pushIntConst(mv, -1);
+            mv.visitInsn(IRETURN);
+
+            mv.visitMaxs(0, 0);
+            mv.visitEnd();
+        }
+
+        private void generateNameLookupDispatcher(String methodName, int numChunks,
+                List<List<String>> chunks) {
+            MethodVisitor mv = cv.visitMethod(ACC_PUBLIC | ACC_STATIC, methodName,
+                    "(Ljava/lang/String;)I", null, null);
+            mv.visitCode();
+
+            Label defaultLabel = new Label();
+            Label[] labels = new Label[numChunks];
+            for (int i = 0; i < numChunks; i++) {
+                labels[i] = chunks.get(i).isEmpty() ? defaultLabel : new Label();
+            }
+
+            mv.visitVarInsn(ALOAD, 0);
+            mv.visitMethodInsn(INVOKEVIRTUAL, "java/lang/String", "hashCode", "()I", false);
+            mv.visitLdcInsn(0x7FFFFFFF);
+            mv.visitInsn(IAND);
+            pushIntConst(mv, numChunks);
+            mv.visitInsn(IREM);
+            mv.visitTableSwitchInsn(0, numChunks - 1, defaultLabel, labels);
+
+            for (int i = 0; i < numChunks; i++) {
+                if (!chunks.get(i).isEmpty()) {
+                    mv.visitLabel(labels[i]);
+                    mv.visitFrame(F_SAME, 0, null, 0, null);
+                    mv.visitVarInsn(ALOAD, 0);
+                    mv.visitMethodInsn(INVOKESTATIC, className, methodName + "$" + i,
+                            "(Ljava/lang/String;)I", isInterface);
+                    mv.visitInsn(IRETURN);
+                }
+            }
 
             mv.visitLabel(defaultLabel);
             mv.visitFrame(F_SAME, 0, null, 0, null);
